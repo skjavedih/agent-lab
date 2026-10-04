@@ -22,3 +22,11 @@ qdrant-client==1.19.1
 langchain-qdrant==1.1.0
 pandas==3.0.6
 
+# API Server
+fastapi==0.142.2
+uvicorn==0.54.0
+
+# Semantic Router (TypeSafe System One / Jev)
+typesafe-sdk==0.7.2
+
+

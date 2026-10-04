@@ -90,6 +90,8 @@ EMBED_MODEL=nomic-embed-text
 CHUNK_SIZE=500
 CHUNK_OVERLAP=50
 ```
+## For python command not found solution
+source .venv/bin/activate
 
 ### 3. Step-by-Step Commands
 

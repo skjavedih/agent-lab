@@ -14,13 +14,31 @@ In Phase 5, a SQLite or Postgres checkpointer will plug directly into this contr
 without requiring any refactoring of callers.
 """
 
+import os
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Iterator, Literal
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph.state import CompiledStateGraph
 
-from app.agent import build_agent, strip_thinking
+from app.agent import (
+    TEXT_SYSTEM_PROMPT,
+    VOICE_SYSTEM_PROMPT,
+    build_agent,
+    get_ollama_llm,
+    strip_thinking,
+)
+from app.router import route
+from app.tools import query_ipl_stats, search_docs, web_search
+
 
 
 @dataclass
@@ -50,6 +68,26 @@ _THREAD_STORES: dict[str, list[BaseMessage]] = defaultdict(list)
 
 # Cache compiled agent graphs by mode ('text' vs 'voice')
 _COMPILED_AGENTS: dict[str, CompiledStateGraph] = {}
+
+
+# Tools mapped to their input argument name for single-tool execution
+_ROUTE_TOOLS = {
+    "ipl_narrative": (search_docs, "query"),
+    "ipl_stats": (query_ipl_stats, "question"),
+    "web_search": (web_search, "query"),
+}
+
+
+def _get_direct_llm_and_prompt(mode: str = "text") -> tuple[Any, str]:
+    """Retrieve chat LLM and appropriate system prompt for non-agent turns."""
+    thinking_enabled = (
+        False
+        if mode == "voice"
+        else os.getenv("ENABLE_THINKING", "false").lower() in ("true", "1", "yes")
+    )
+    prompt = VOICE_SYSTEM_PROMPT if mode == "voice" else TEXT_SYSTEM_PROMPT
+    llm = get_ollama_llm(enable_thinking=thinking_enabled)
+    return llm, prompt
 
 
 def get_agent(mode: str = "text") -> CompiledStateGraph:
@@ -92,61 +130,116 @@ def run_turn(
     if not clean_input:
         return
 
-    # 1. Retrieve the appropriate agent for this mode ('text' or 'voice')
-    agent = get_agent(mode=mode)
-
-    # 2. Add user message to conversation history for this thread
+    # Add user message to conversation history for this thread
     user_message = HumanMessage(content=clean_input)
     thread_history = _THREAD_STORES[thread_id]
+    initial_len = len(thread_history)
     thread_history.append(user_message)
 
-    # 3. LangGraph configuration with thread_id for state isolation
-    # Passing thread_id here ensures full compatibility with Phase 5 checkpointers
-    graph_config = {"configurable": {"thread_id": thread_id}}
+    # 1. Route the query using TypeSafe System One (Jev). Fall back to ReAct agent if Jev fails.
+    try:
+        route_decision = route(clean_input)
+    except Exception:
+        route_decision = "browser_task"
 
     try:
-        # Stream updates from the ReAct graph
-        for chunk in agent.stream(
+        # Route: chat -> one direct LLM call, no tools; stream tokens
+        if route_decision == "chat":
+            llm, system_prompt = _get_direct_llm_and_prompt(mode=mode)
+            accumulated = ""
+            for token in llm.stream([SystemMessage(content=system_prompt)] + thread_history):
+                text = strip_thinking(token.content)
+                if text:
+                    accumulated += text
+                    yield AgentEvent(type="answer", content=text)
+            thread_history.append(AIMessage(content=accumulated))
+            return
+
+        # Route: ipl_narrative / ipl_stats / web_search -> single tool, then stream LLM answer
+        if route_decision in _ROUTE_TOOLS:
+            tool, arg_name = _ROUTE_TOOLS[route_decision]
+            tool_args = {arg_name: clean_input}
+            yield AgentEvent(
+                type="thought_action",
+                content="",
+                tool_name=tool.name,
+                tool_args=tool_args,
+            )
+            tool_result = str(tool.invoke(tool_args))
+            yield AgentEvent(
+                type="observation",
+                content=tool_result,
+                tool_name=tool.name,
+            )
+
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            thread_history.append(
+                AIMessage(
+                    content="",
+                    tool_calls=[{"id": call_id, "name": tool.name, "args": tool_args}],
+                )
+            )
+            thread_history.append(
+                ToolMessage(
+                    content=tool_result,
+                    tool_call_id=call_id,
+                    name=tool.name,
+                )
+            )
+
+            llm, system_prompt = _get_direct_llm_and_prompt(mode=mode)
+            accumulated = ""
+            for token in llm.stream([SystemMessage(content=system_prompt)] + thread_history):
+                text = strip_thinking(token.content)
+                if text:
+                    accumulated += text
+                    yield AgentEvent(type="answer", content=text)
+            thread_history.append(AIMessage(content=accumulated))
+            return
+
+        # Route: browser_task or fallback -> existing ReAct agent with token streaming
+        agent = get_agent(mode=mode)
+        graph_config = {"configurable": {"thread_id": thread_id}}
+
+        for stream_type, data in agent.stream(
             {"messages": thread_history},
             config=graph_config,
-            stream_mode="updates",
+            stream_mode=["updates", "messages"],
         ):
-            for node_name, update in chunk.items():
-                messages = update.get("messages", [])
-                for msg in messages:
-                    # Append all intermediate steps (AIMessage, ToolMessage) to keep history consistent
-                    thread_history.append(msg)
-
-                    # Reason / Act step: The LLM decided to invoke one or more tools
-                    if isinstance(msg, AIMessage) and msg.tool_calls:
-                        for tc in msg.tool_calls:
+            if stream_type == "updates":
+                # "updates" carries completed messages for history tracking and tool events
+                for node_name, update in data.items():
+                    for msg in update.get("messages", []):
+                        thread_history.append(msg)
+                        if isinstance(msg, AIMessage) and msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                yield AgentEvent(
+                                    type="thought_action",
+                                    content=msg.content or "",
+                                    tool_name=tc.get("name"),
+                                    tool_args=tc.get("args"),
+                                )
+                        elif isinstance(msg, ToolMessage):
                             yield AgentEvent(
-                                type="thought_action",
-                                content=msg.content or "",
-                                tool_name=tc.get("name"),
-                                tool_args=tc.get("args"),
+                                type="observation",
+                                content=str(msg.content),
+                                tool_name=getattr(msg, "name", "tool"),
                             )
-
-                    # Observation step: The tool execution returned results
-                    elif isinstance(msg, ToolMessage):
-                        tool_name = getattr(msg, "name", "tool")
-                        yield AgentEvent(
-                            type="observation",
-                            content=str(msg.content),
-                            tool_name=tool_name,
-                        )
-
-                    # Final Answer step: The LLM produced its final response
-                    elif isinstance(msg, AIMessage) and not msg.tool_calls:
-                        # In voice mode or when thinking is disabled, sanitize any <think> tags
-                        answer_text = strip_thinking(msg.content)
-                        yield AgentEvent(
-                            type="answer",
-                            content=answer_text,
-                        )
+            elif stream_type == "messages":
+                # "messages" carries per-token AIMessageChunks for live answer streaming
+                msg, _meta = data
+                if (
+                    isinstance(msg, AIMessageChunk)
+                    and msg.content
+                    and not getattr(msg, "tool_call_chunks", None)
+                ):
+                    text = strip_thinking(msg.content)
+                    if text:
+                        yield AgentEvent(type="answer", content=text)
 
     except Exception:
-        # Rollback the last user message if the turn fails so the thread state isn't broken
-        if thread_history and thread_history[-1] is user_message:
+        # Rollback all messages added during this turn if it fails
+        while len(thread_history) > initial_len:
             thread_history.pop()
         raise
+
