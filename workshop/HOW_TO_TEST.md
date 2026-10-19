@@ -33,6 +33,8 @@ Open the URL Gradio prints (usually http://127.0.0.1:7860).
 
 3. **Lesson 5 only:** set `TAVILY_API_KEY` in `.env` and restart the demo.
 
+4. **Lesson 6:** same RAG prerequisites as lessons 2 and 4 (Qdrant + ingest).
+
 **Tips:**
 
 - Click **Clear chat** between lessons for a clean chat panel.
@@ -148,6 +150,26 @@ python -m scripts.inspect_retrieval "2016 IPL final"
 
 ---
 
+## Lesson 6 — Multi-agent: RAG sub-agents → synthesize
+
+**Goal:** One **shared retrieve** step, then **two specialist sub-agents** (both `ChatOllama`) read the same RAG context in **parallel**, then a **synthesize** node merges their reports into the final answer.
+
+| Step | Action | Pass if |
+|------|--------|---------|
+| 1 | **Clear chat**, select **lesson 6** | — |
+| 2 | Temperature **0.2**; **Thread ID does not matter** | — |
+| 3 | Ask: *Describe the 2016 IPL final — stats and how the match unfolded.* | One cohesive answer (stats + story) |
+| 4 | Read **Teaching trace** | `nodes: retrieve`, `stats_analyst + narrative_analyst (parallel Ollama) → synthesize`, and previews for both sub-agents |
+| 5 | Ask something off-topic: *Who won the 2016 FIFA World Cup?* | Answer: **I don't know — that isn't in our cricket match database.** Trace shows `rag_gate` and `synthesize (template only — no Ollama)` — not FIFA facts from model weights |
+
+**Talking points:**
+
+- **Sub-agents** = separate prompts/roles on the same retrieved documents (not separate vector stores).
+- **Supervisor** = the `synthesize` node (third Ollama call) that concludes for the user.
+- Contrast with **lesson 4**: one ReAct agent chooses tools; here the **graph** fixes the workflow (retrieve → specialists → merge).
+
+---
+
 ## Temperature demo (any lesson with generation)
 
 Use lesson **2** or **4** with the same factual question twice:
@@ -170,6 +192,7 @@ Trace always includes `temperature=...`.
 | 3 | Same thread recalls facts | Name + team, then “What’s my name?” |
 | 4 | `search_cricket_docs` | Describe 2016 IPL final |
 | 5 | `web_search_tavily` | Today’s cricket news |
+| 6 | `stats_analyst + narrative_analyst → synthesize` | 2016 IPL final stats + narrative |
 
 ---
 

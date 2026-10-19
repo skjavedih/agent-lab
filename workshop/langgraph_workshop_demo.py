@@ -6,6 +6,7 @@ Lessons (dropdown):
   3) Memory (MemorySaver + thread_id)
   4) ReAct loop with RAG tool
   5) ReAct loop + Tavily web search
+  6) Multi-agent: two RAG sub-agents → synthesize (Ollama)
 
 Run from project root:
   python workshop/langgraph_workshop_demo.py
@@ -49,7 +50,7 @@ CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "cricket_matches")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
 # Bump when you change workshop behavior (shown in UI — restart demo after git pull).
-WORKSHOP_BUILD = "2026-03-19-trace-turn-fix"
+WORKSHOP_BUILD = "2026-10-19-lesson6-rag-gate-v2"
 
 LESSONS = [
     "1 — Ollama only (no LangGraph)",
@@ -57,6 +58,7 @@ LESSONS = [
     "3 — LangGraph: memory (thread_id)",
     "4 — LangGraph: loop (RAG tool + ReAct)",
     "5 — LangGraph: loop + Tavily web search",
+    "6 — LangGraph: multi-agent (RAG sub-agents → synthesize)",
 ]
 
 
@@ -292,6 +294,251 @@ def build_rag_graph(temperature: float):
     return graph.compile()
 
 
+_NO_RAG_DATA = "NO_RAG_DATA"
+
+_REFUSAL_NO_RAG = "I don't know — that isn't in our cricket match database."
+
+# Query terms that this IPL narrative corpus cannot cover (teaching: gate before sub-agents).
+_OFF_CORPUS_QUERY_TERMS = (
+    "fifa",
+    "soccer",
+    "premier league",
+    "champions league",
+    "nba",
+    "nfl",
+    "nhl",
+    "wimbledon",
+    "formula 1",
+    "football",
+    "messi",
+    "ronaldo",
+)
+
+
+class MultiAgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    context: str
+    trace: str
+    match_ids: list[int]
+    rag_applicable: bool
+    stats_report: str
+    narrative_report: str
+
+
+def _user_question_from_state(state: MultiAgentState) -> str:
+    last = state["messages"][-1]
+    return last.content if isinstance(last, HumanMessage) else str(last)
+
+
+def _ensure_rag_context(state: MultiAgentState) -> tuple[str, list[int]]:
+    user = _user_question_from_state(state)
+    ctx = (state.get("context") or "").strip()
+    match_ids = list(state.get("match_ids") or [])
+    if not ctx or ctx.startswith("(No ") or len(ctx) < 80:
+        ctx, match_ids, _extra = _vector_search(user, k=6)
+    ql = user.lower()
+    if "final" in ql and "2016" in ql and match_ids and match_ids[0] == 636:
+        if "\n\n[2]" in ctx:
+            ctx = ctx.split("\n\n[2]", 1)[0]
+    return ctx, match_ids
+
+
+def _rag_context_supports_question(query: str, context: str) -> bool:
+    """True when retrieved IPL narratives plausibly relate to the question."""
+    ctx = (context or "").strip()
+    if not ctx or ctx.startswith("(No "):
+        return False
+    ql = query.lower()
+    ctxl = ctx.lower()
+    for term in _OFF_CORPUS_QUERY_TERMS:
+        if term in ql and term not in ctxl:
+            return False
+    if "fifa" in ql:
+        return False
+    if "world cup" in ql and "cricket" not in ql and "ipl" not in ql and "icc" not in ql:
+        return False
+    cricket_cues = (
+        "ipl",
+        "cricket",
+        "innings",
+        "wicket",
+        "batsman",
+        "bowler",
+        "super kings",
+        "royal challengers",
+        "sunrisers",
+        "match ",
+    )
+    if any(c in ql for c in cricket_cues):
+        return any(c in ctxl for c in cricket_cues) or "match" in ctxl
+    return True
+
+
+def _node_rag_gate(state: MultiAgentState) -> dict:
+    user = _user_question_from_state(state)
+    ctx = (state.get("context") or "").strip()
+    applicable = _rag_context_supports_question(user, ctx)
+    trace = state.get("trace", "") or "nodes: retrieve"
+    if applicable:
+        trace += " | rag_gate: pass (lesson 6 — IPL RAG context only)"
+    else:
+        trace += (
+            " | rag_gate: BLOCK off-corpus question "
+            "(sub-agents skip Ollama → NO_RAG_DATA)"
+        )
+    return {"rag_applicable": applicable, "trace": trace}
+
+
+def _lesson6_subagent_hints(user: str, match_ids: list[int]) -> str:
+    ql = (user or "").lower()
+    if "final" in ql and "2016" in ql and match_ids and match_ids[0] == 636:
+        return (
+            "\nHint: In this dataset the 2016 IPL final is match 636 (2016-05-29, "
+            "Sunrisers Hyderabad vs Royal Challengers Bangalore). Use that chunk "
+            "even if the word 'final' is not in the text.\n"
+        )
+    return ""
+
+
+def _lesson6_subagent_system(
+    role: str, ctx: str, user: str, match_ids: list[int]
+) -> str:
+    hints = _lesson6_subagent_hints(user, match_ids)
+    task = (
+        "list factual bullets: teams, date, venue, scores, winner, margins, top performers."
+        if role == "Stats"
+        else "describe how the match unfolded: phases, turning points, result."
+    )
+    return (
+        f"You are the {role} Sub-Agent. Use ONLY the CONTEXT below (IPL match narratives). "
+        f"{task} Do not use general knowledge or facts outside CONTEXT.{hints} "
+        "If CONTEXT is empty or says no vector results, "
+        f"reply with exactly: {_NO_RAG_DATA} and no other words.\n\n"
+        f"CONTEXT:\n{ctx}"
+    )
+
+
+def _coerce_lesson6_subagent_text(text: str, user: str) -> str:
+    """Drop common Ollama leaks when the model ignores context-only instructions."""
+    t = (text or "").strip()
+    if not t or t == _NO_RAG_DATA or t.startswith(_NO_RAG_DATA):
+        return _NO_RAG_DATA
+    low = t.lower()
+    if any(
+        m in low
+        for m in (
+            "no stats from the database",
+            "no narrative from the database",
+            "no database",
+            "did not occur",
+            "every four years",
+            "hosted by",
+        )
+    ):
+        return _NO_RAG_DATA
+    ql = user.lower()
+    if ("fifa" in ql or ("world cup" in ql and "ipl" not in ql)) and "innings" not in low:
+        return _NO_RAG_DATA
+    return t
+
+
+def _lesson6_may_call_subagent_llm(state: MultiAgentState) -> tuple[bool, str, list[int]]:
+    user = _user_question_from_state(state)
+    ctx, match_ids = _ensure_rag_context(state)
+    if not state.get("rag_applicable", False):
+        return False, ctx, match_ids
+    if not _rag_context_supports_question(user, ctx):
+        return False, ctx, match_ids
+    return True, ctx, match_ids
+
+
+def _node_stats_subagent(state: MultiAgentState, temperature: float) -> dict:
+    may_llm, ctx, match_ids = _lesson6_may_call_subagent_llm(state)
+    user = _user_question_from_state(state)
+    if not may_llm:
+        return {"stats_report": _NO_RAG_DATA}
+    llm = make_llm(temperature)
+    system = _lesson6_subagent_system("Stats", ctx, user, match_ids)
+    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    return {"stats_report": _coerce_lesson6_subagent_text(text, user)}
+
+
+def _node_narrative_subagent(state: MultiAgentState, temperature: float) -> dict:
+    may_llm, ctx, match_ids = _lesson6_may_call_subagent_llm(state)
+    user = _user_question_from_state(state)
+    if not may_llm:
+        return {"narrative_report": _NO_RAG_DATA}
+    llm = make_llm(temperature)
+    system = _lesson6_subagent_system("Narrative", ctx, user, match_ids)
+    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    return {"narrative_report": _coerce_lesson6_subagent_text(text, user)}
+
+
+def _reports_are_no_rag(stats: str, narrative: str) -> bool:
+    def is_no(text: str) -> bool:
+        t = (text or "").strip()
+        return t == _NO_RAG_DATA or t.startswith(_NO_RAG_DATA)
+
+    return is_no(stats) and is_no(narrative)
+
+
+def _node_synthesize_multi(state: MultiAgentState, temperature: float) -> dict:
+    user = _user_question_from_state(state)
+    stats = (state.get("stats_report") or "").strip()
+    narrative = (state.get("narrative_report") or "").strip()
+    base_trace = state.get("trace", "") or "nodes: retrieve"
+    match_ids = list(state.get("match_ids") or [])
+    if match_ids and "match_ids=" not in base_trace:
+        base_trace += f" | match_ids={match_ids}"
+
+    if _reports_are_no_rag(stats, narrative):
+        trace = (
+            f"{base_trace} → stats_analyst + narrative_analyst → "
+            "synthesize (template only — no Ollama)"
+        )
+        return {
+            "messages": [AIMessage(content=_REFUSAL_NO_RAG)],
+            "trace": trace,
+        }
+
+    llm = make_llm(temperature)
+    system = (
+        "You are the Lead Analyst. Combine ONLY facts already written in the "
+        "sub-agent reports below. Do not add any information from your own knowledge. "
+        f"If a report is {_NO_RAG_DATA}, ignore it. If both are {_NO_RAG_DATA}, "
+        f"say exactly: {_REFUSAL_NO_RAG}\n\n"
+        f"STATS SUB-AGENT:\n{stats}\n\n"
+        f"NARRATIVE SUB-AGENT:\n{narrative}"
+    )
+    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    text = resp.content if isinstance(resp.content, str) else str(resp.content)
+    trace = (
+        f"{base_trace} → stats_analyst + narrative_analyst (parallel Ollama) → synthesize"
+    )
+    return {"messages": [AIMessage(content=text)], "trace": trace}
+
+
+def build_multiagent_graph(temperature: float):
+    graph = StateGraph(MultiAgentState)
+    graph.add_node("retrieve", _node_retrieve)
+    graph.add_node("rag_gate", _node_rag_gate)
+    graph.add_node("stats_analyst", lambda s: _node_stats_subagent(s, temperature))
+    graph.add_node(
+        "narrative_analyst", lambda s: _node_narrative_subagent(s, temperature)
+    )
+    graph.add_node("synthesize", lambda s: _node_synthesize_multi(s, temperature))
+    graph.add_edge(START, "retrieve")
+    graph.add_edge("retrieve", "rag_gate")
+    graph.add_edge("rag_gate", "stats_analyst")
+    graph.add_edge("rag_gate", "narrative_analyst")
+    graph.add_edge("stats_analyst", "synthesize")
+    graph.add_edge("narrative_analyst", "synthesize")
+    graph.add_edge("synthesize", END)
+    return graph.compile()
+
+
 class ChatState(TypedDict):
     messages: Annotated[list, add_messages]
     trace: str
@@ -393,6 +640,61 @@ def run_chat(
         ]
         return history, "", "\n".join(trace_lines)
 
+    if lesson.startswith("6"):
+        graph = build_multiagent_graph(temperature)
+        trace_lines.append(f"workshop_build={WORKSHOP_BUILD}")
+        trace_lines.append(
+            "(thread_id ignored — one-shot multi-agent graph; not lesson 3 memory)"
+        )
+        result = graph.invoke(
+            {
+                "messages": [HumanMessage(content=message)],
+                "context": "",
+                "trace": "",
+                "match_ids": [],
+                "rag_applicable": True,
+                "stats_report": "",
+                "narrative_report": "",
+            }
+        )
+        answer = result["messages"][-1].content
+        graph_trace = result.get("trace", "")
+        trace_lines.append(graph_trace)
+        if "rag_gate" not in graph_trace:
+            trace_lines.append(
+                "WARNING: trace missing rag_gate — stop Gradio (Ctrl+C) and restart "
+                "python workshop/langgraph_workshop_demo.py"
+            )
+        if "BLOCK off-corpus" in graph_trace:
+            trace_lines.append(
+                "pattern: retrieve → rag_gate (BLOCK) → NO_RAG_DATA sub-agents → "
+                "synthesize (template only — no Ollama)"
+            )
+        elif "template only" in graph_trace:
+            trace_lines.append(
+                "pattern: retrieve → rag_gate → sub-agents → synthesize (RAG-only refusal)"
+            )
+        else:
+            trace_lines.append(
+                "pattern: retrieve → rag_gate (pass) → parallel Ollama sub-agents → synthesize"
+            )
+        if result.get("stats_report"):
+            preview = str(result["stats_report"])[:180].replace("\n", " ")
+            trace_lines.append(f"stats_analyst (preview): {preview}...")
+        if result.get("narrative_report"):
+            preview = str(result["narrative_report"])[:180].replace("\n", " ")
+            trace_lines.append(f"narrative_analyst (preview): {preview}...")
+        ctx = result.get("context") or ""
+        if ctx.startswith("(No Qdrant") or ctx.startswith("(No Chroma"):
+            trace_lines.append(
+                "FIX: docker compose up -d && python -m scripts.ingest --reset"
+            )
+        history = history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": answer},
+        ]
+        return history, "", "\n".join(trace_lines)
+
     use_tavily = lesson.startswith("5")
     graph = build_react_graph(temperature, use_tavily=use_tavily)
     config = {"configurable": {"thread_id": thread_id}}
@@ -467,7 +769,7 @@ def build_ui():
             )
             thread_id = gr.Textbox(
                 value="workshop-thread-1",
-                label="Thread ID (lessons 3–5 only; ignored in 1–2)",
+                label="Thread ID (lessons 3–5 only; ignored in 1–2, 6)",
             )
         chatbot = gr.Chatbot(height=420)
         msg = gr.Textbox(

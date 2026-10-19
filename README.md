@@ -145,9 +145,9 @@ source .venv/bin/activate
 
 8. **LangGraph workshop (step-by-step browser UI)**:
 
-   Single teaching file: `workshop/langgraph_workshop_demo.py`. It opens a Gradio chat UI with five lessons in one dropdown—Ollama only, linear RAG graph, memory (`thread_id`), ReAct loop with RAG, then ReAct + Tavily. Use the **Teaching trace** panel to show which nodes and tools ran.
+   Single teaching file: `workshop/langgraph_workshop_demo.py`. It opens a Gradio chat UI with six lessons in one dropdown—Ollama only, linear RAG graph, memory (`thread_id`), ReAct loop with RAG, ReAct + Tavily, then multi-agent RAG sub-agents with a synthesize step. Use the **Teaching trace** panel to show which nodes and tools ran.
 
-   **Prerequisites:** Ollama running; for lessons 2–5 with this repo’s data, complete steps 2–3 (Qdrant + ingest). Lesson 5 needs `TAVILY_API_KEY` in `.env`.
+   **Prerequisites:** Ollama running; for lessons 2–4 and 6 with this repo’s data, complete steps 2–3 (Qdrant + ingest). Lesson 5 needs `TAVILY_API_KEY` in `.env`.
 
    ```bash
    pip install -r requirements.txt   # includes gradio; chromadb only needed if VECTOR_BACKEND=chroma
