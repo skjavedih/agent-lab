@@ -26,6 +26,11 @@ pandas==3.0.6
 fastapi==0.142.2
 uvicorn==0.54.0
 
+# LangGraph workshop UI (optional Chroma for classroom RAG)
+gradio>=6.30.0
+langchain-chroma==1.1.0
+chromadb>=1.0.0
+
 # Semantic Router (TypeSafe System One / Jev)
 typesafe-sdk==0.7.2
 

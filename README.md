@@ -21,6 +21,8 @@ for event in run_turn(user_text="Who won the 2016 IPL final?", thread_id="sessio
 ```
 This enables `main.py` (CLI), `app/voice.py` (future Speech-To-Text / Text-To-Speech loop), or a FastAPI server to run the same agent without changes.
 
+**Architecture diagrams (chatbot connection flow, RAG, Qdrant, Tavily, voice):** see [Architecture-diagram.md](./Architecture-diagram.md) — start with *Connecting your chatbot*.
+
 ### Dual Query Paths (Phase 3: RAG + Analytics)
 1. **Narrative Path (`app/rag.py` / `search_docs` tool)**:
    - Evaluates match-level questions ("tell me about...", "describe the 2016 final", "what happened when...").
@@ -109,16 +111,73 @@ source .venv/bin/activate
    ```
 4. **Test Vector Retrieval (No LLM call)**:
    ```bash
+   
    python -m scripts.inspect_retrieval "Who won the 2016 IPL final?"
    ```
 5. **Test Structured Stats Query**:
    ```bash
    python -c "from app.analytics import query_ipl_stats; print(query_ipl_stats('How many matches has Mumbai Indians won in total?'))"
    ```
-6. **Start Interactive Chat**:
+6. **Start Interactive Chat (terminal CLI)**:
    ```bash
    python main.py
    ```
+   Optional flags: `--mode voice`, `--thread session-1`.
+
+7. **Start Web UI (browser chat)**:
+
+   `main.py` is terminal-only. The browser UI lives in `static/index.html` and is served by `app/server.py`.
+
+   Ensure Ollama is running (and Qdrant via step 2 if you use RAG). From the project root with your venv activated:
+
+   ```bash
+   uvicorn app.server:app --reload
+   ```
+
+   Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/) (default port **8000**). The page streams replies from `POST /chat` using the same `run_turn()` agent as the CLI (including mic/speaker voice controls in the UI).
+
+   | Entry point | Command |
+   |-------------|---------|
+   | Terminal | `python main.py` |
+   | Browser | `uvicorn app.server:app --reload` → open port 8000 |
+
+   Optional: `uvicorn app.server:app --reload --port 8080` to use another port.
+
+8. **LangGraph workshop (step-by-step browser UI)**:
+
+   Single teaching file: `workshop/langgraph_workshop_demo.py`. It opens a Gradio chat UI with five lessons in one dropdown—Ollama only, linear RAG graph, memory (`thread_id`), ReAct loop with RAG, then ReAct + Tavily. Use the **Teaching trace** panel to show which nodes and tools ran.
+
+   **Prerequisites:** Ollama running; for lessons 2–5 with this repo’s data, complete steps 2–3 (Qdrant + ingest). Lesson 5 needs `TAVILY_API_KEY` in `.env`.
+
+   ```bash
+   pip install -r requirements.txt   # includes gradio; chromadb only needed if VECTOR_BACKEND=chroma
+   python workshop/langgraph_workshop_demo.py
+   ```
+
+   Gradio prints a local URL (typically [http://127.0.0.1:7860](http://127.0.0.1:7860)). Teach in order:
+
+   | Lesson | What to show |
+   |--------|----------------|
+   | 1 | Direct `ChatOllama` — same idea as yesterday’s chatbot, no graph yet |
+   | 2 | Two-node graph: **retrieve** → **generate** (RAG) |
+   | 3 | `MemorySaver` + **Thread ID** — change thread to reset memory |
+   | 4 | **Loop**: agent calls `search_cricket_docs`, then answers |
+   | 5 | Adds **Tavily** (`web_search_tavily`) for live web questions |
+
+   Adjust **Temperature** on any lesson to contrast factual (low) vs creative (high) replies.
+
+   **Classroom Chroma (optional):** set `VECTOR_BACKEND=chroma` and `CHROMA_PATH` / `CHROMA_COLLECTION` in `.env` instead of Qdrant. Default for Agent Lab is `VECTOR_BACKEND=qdrant`.
+
+   **Full lesson-by-lesson test script:** [workshop/HOW_TO_TEST.md](./workshop/HOW_TO_TEST.md).
+
+   See also [Architecture-diagram.md](./Architecture-diagram.md) for how the full app’s LangGraph agent relates to this minimal demo.
+
+   Fresh start when - 
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   docker compose up -d
+   python -m scripts.ingest --reset   # for RAG lessons
+   python workshop/langgraph_workshop_demo.py
 
 ---
 
@@ -148,9 +207,12 @@ agent-lab/
 │   ├── memory.py              # Phase 5 placeholder: SQLite checkpointer
 │   ├── rag.py                 # Match document builder, Nomic embeddings wrapper, Qdrant store
 │   ├── router.py              # Phase 8 placeholder: Semantic query router
+│   ├── server.py              # FastAPI app: serves UI and POST /chat (SSE)
 │   ├── service.py             # Decoupled service layer: run_turn() generator & thread state
 │   ├── tools.py               # Tools: search_docs, query_ipl_stats, calculator, time, search
 │   └── voice.py               # Phase 2: Speech-To-Text / Text-To-Speech loop
+├── static/
+│   └── index.html             # Browser chat UI (voice mic/speaker supported)
 ├── data/
 │   ├── deliveries.csv         # Kaggle IPL ball-by-ball dataset (150k rows)
 │   └── matches.csv            # Kaggle IPL match-by-match dataset (636 rows)
@@ -159,6 +221,9 @@ agent-lab/
 │   ├── inspect_data.py        # Inspects CSV shape, dtypes, samples, and nulls
 │   └── inspect_retrieval.py   # Test vector retrieval top-k with scores without LLM
 ├── docker-compose.yml         # Qdrant vector database container configuration
+├── workshop/
+│   ├── langgraph_workshop_demo.py  # Gradio UI: LangGraph lessons (Ollama → RAG → memory → ReAct → Tavily)
+│   └── HOW_TO_TEST.md              # Step-by-step checklist to test each workshop lesson
 ├── main.py                    # Interactive CLI wrapper supporting --mode and --thread
 ├── requirements.txt           # Dependencies (pandas, langchain, qdrant-client, ollama)
 ├── .env.example               # Environment variables template

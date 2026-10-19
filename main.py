@@ -112,8 +112,12 @@ def main():
                 mode=args.mode,
             )
 
+            answer_started = False
             for event in events:
                 if event.type == "thought_action":
+                    if answer_started:
+                        print()
+                        answer_started = False
                     if event.content:
                         print(f"\n[THOUGHT/ACTION] Thought: {event.content}")
                     print(
@@ -121,12 +125,23 @@ def main():
                     )
 
                 elif event.type == "observation":
+                    if answer_started:
+                        print()
+                        answer_started = False
                     print(
                         f"[OBSERVATION] Tool '{event.tool_name}' returned: {event.content}"
                     )
 
                 elif event.type == "answer":
-                    print(f"\n[ANSWER]\n{event.content}")
+                    # Tokens arrive one at a time; print the label once and
+                    # append each token on the same line.
+                    if not answer_started:
+                        print("\n[ANSWER] ", end="", flush=True)
+                        answer_started = True
+                    print(event.content, end="", flush=True)
+
+            if answer_started:
+                print()
 
             elapsed = time.perf_counter() - start_time
             print(f"\n[⏱️ Response time: {elapsed:.2f}s]")

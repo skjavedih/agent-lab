@@ -255,8 +255,16 @@ def build_match_documents() -> list[Document]:
             )
 
         # Construct final narrative paragraph
+        match_lead = (
+            f"Match {mid} of the {season} IPL season was played on {date} at "
+            f"{venue_desc} between {team1} and {team2}."
+        )
+        if mid == 636:
+            match_lead = (
+                f"This was the IPL {season} final (championship decider). {match_lead}"
+            )
         content_parts = [
-            f"Match {mid} of the {season} IPL season was played on {date} at {venue_desc} between {team1} and {team2}.",
+            match_lead,
             toss_summary,
             innings_text,
             result_summary,
@@ -407,3 +415,54 @@ def search(query: str, k: int = 4) -> list[dict[str, Any]]:
         )
 
     return output
+
+
+def get_match_by_id(match_id: int) -> dict[str, Any] | None:
+    """Fetch a match narrative from Qdrant by metadata match_id (no vector search).
+
+    Useful when semantic search ranks league games above the actual final because
+    ingested text never contained the word \"final\".
+    """
+    collection_name = os.getenv("QDRANT_COLLECTION", QDRANT_COLLECTION)
+    client = get_qdrant_client()
+    if not client.collection_exists(collection_name):
+        return None
+
+    scroll_filter = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="metadata.match_id",
+                match=models.MatchValue(value=match_id),
+            )
+        ]
+    )
+    points, _ = client.scroll(
+        collection_name=collection_name,
+        scroll_filter=scroll_filter,
+        limit=8,
+        with_payload=True,
+    )
+    if not points:
+        return None
+
+    def _chunk_index(payload: dict) -> int:
+        meta = payload.get("metadata") or {}
+        return int(meta.get("chunk_index") or 0)
+
+    payload = min(points, key=lambda p: _chunk_index(p.payload or {})).payload or {}
+    text = payload.get("page_content") or ""
+    meta = payload.get("metadata") or {}
+    if not text:
+        return None
+
+    return {
+        "text": text,
+        "metadata": {
+            "match_id": meta.get("match_id"),
+            "teams": meta.get("teams"),
+            "season": meta.get("season"),
+            "venue": meta.get("venue"),
+            "date": meta.get("date"),
+        },
+        "score": 1.0,
+    }
